@@ -1438,6 +1438,60 @@ class CustomOutputStream final : public arrow::io::OutputStream, public AsyncOut
     return arrow::Status::OK();
   }
 
+  // Complete may have succeeded before the SDK lost its response and retried
+  // the consumed upload ID. Only reconcile ordinary writes whose complete
+  // multipart ETag can be reconstructed; metadata/conditional writes may have
+  // additional effects that a content match alone cannot establish.
+  bool CompletedObjectMatchesParts() {
+    const auto& metadata = metadata_ && metadata_->size() != 0 ? metadata_ : default_metadata_;
+    if ((metadata && metadata->size() != 0) || !io_context_.stop_token().Poll().ok()) {
+      return false;
+    }
+
+    Aws::StringStream part_hashes;
+    const auto& parts = upload_state_->completed_parts;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      const auto& etag = parts[i].GetETag();
+      if (parts[i].GetPartNumber() != static_cast<int>(i + 1) || etag.size() != 34 || etag.front() != '"' ||
+          etag.back() != '"') {
+        return false;
+      }
+      auto hex_digit = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+          return c - '0';
+        if (c >= 'a' && c <= 'f')
+          return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+          return c - 'A' + 10;
+        return -1;
+      };
+      for (size_t j = 1; j < 33; j += 2) {
+        const auto high = hex_digit(etag[j]);
+        const auto low = hex_digit(etag[j + 1]);
+        if (high < 0 || low < 0)
+          return false;
+        part_hashes.put(static_cast<char>((high << 4) | low));
+      }
+    }
+    if (parts.empty())
+      return false;
+    const auto digest = Aws::Utils::HashingUtils::CalculateMD5(part_hashes);
+    if (digest.GetLength() != 16)
+      return false;
+    const auto expected =
+        "\"" + Aws::Utils::HashingUtils::HexEncode(digest) + "-" + ToAwsString(std::to_string(parts.size())) + "\"";
+
+    auto lock = holder_->Lock();
+    if (!lock.ok())
+      return false;
+    S3Model::HeadObjectRequest req;
+    req.SetBucket(ToAwsString(path_.bucket));
+    req.SetKey(ToAwsString(path_.key));
+    const auto outcome = std::move(lock).ValueOrDie().Move()->HeadObject(req);
+    return io_context_.stop_token().Poll().ok() && outcome.IsSuccess() &&
+           outcome.GetResult().GetContentLength() == pos_ && outcome.GetResult().GetETag() == expected;
+  }
+
   arrow::Status FinishPartUploadAfterFlush() {
     FIU_RETURN_ON(FIUKEY_S3FS_COMPLETE_UPLOAD_FAIL,
                   arrow::Status::IOError(fmt::format("Injected fault: {}", FIUKEY_S3FS_COMPLETE_UPLOAD_FAIL)));
@@ -1459,6 +1513,9 @@ class CustomOutputStream final : public arrow::io::OutputStream, public AsyncOut
 
     auto outcome = client_lock.Move()->CompleteMultipartUploadWithErrorFixup(std::move(req));
     if (!outcome.IsSuccess()) {
+      if (outcome.GetError().GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD && CompletedObjectMatchesParts()) {
+        return arrow::Status::OK();
+      }
       return ErrorToStatus(std::forward_as_tuple("When completing multiple part upload for key '", path_.key,
                                                  "' in bucket '", path_.bucket, "': "),
                            "CompleteMultipartUpload", outcome.GetError());

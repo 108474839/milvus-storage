@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -127,10 +128,14 @@ class S3UnitTest : public ::testing::Test {
 class S3ResponseServer {
   using Tcp = boost::asio::ip::tcp;
   using Response = boost::beast::http::response<boost::beast::http::string_body>;
+  using Request = boost::beast::http::request<boost::beast::http::string_body>;
 
   public:
-  explicit S3ResponseServer(std::vector<Response> responses)
-      : acceptor_(context_, {boost::asio::ip::address_v4::loopback(), 0}), responses_(std::move(responses)) {
+  explicit S3ResponseServer(std::vector<Response> responses,
+                            std::function<void(size_t, const Request&, Response&)> on_request = {})
+      : acceptor_(context_, {boost::asio::ip::address_v4::loopback(), 0}),
+        responses_(std::move(responses)),
+        on_request_(std::move(on_request)) {
     Accept();
     thread_ = std::thread([this] { context_.run(); });
   }
@@ -183,6 +188,8 @@ class S3ResponseServer {
       }
       const auto index = requests_.fetch_add(1);
       auto& response = responses_[std::min(index, responses_.size() - 1)];
+      if (on_request_)
+        on_request_(index, parser_->get(), response);
       response.keep_alive(false);
       // An explicit length allows tests to send a deliberately truncated response.
       if (!response.has_content_length()) {
@@ -204,6 +211,7 @@ class S3ResponseServer {
   boost::beast::http::response<boost::beast::http::empty_body> continue_response_{boost::beast::http::status::continue_,
                                                                                   11};
   std::vector<Response> responses_;
+  std::function<void(size_t, const Request&, Response&)> on_request_;
   std::atomic<size_t> requests_{0};
   std::atomic<bool> only_gets_{true};
   std::thread thread_;
@@ -524,6 +532,132 @@ TEST_F(S3UnitTest, MultipartCompletionErrorCountsFailure) {
   EXPECT_EQ(client->GetMetrics()->GetFailedCount(), 1);
   EXPECT_EQ(client->GetMetrics()->GetMultiPartUploadFinished(), 1);
   EXPECT_EQ(server.requests(), 1);
+}
+
+TEST_F(S3UnitTest, ReconcilesLostMultipartCompletionOnlyForMatchingContent) {
+  namespace http = boost::beast::http;
+  using Response = http::response<http::string_body>;
+  // MD5("abcd"), MD5("efgh"), and MD5 of those two binary digests.
+  const std::string first = "\"e2fc714c4727ee9395f324cd2e7f331f\"";
+  const std::string second = "\"1f7690ebdd9b4caf8fab49ca1757bf27\"";
+  const std::string complete = "\"cb93ad6c9c920e2602b79a11ded63ddb-2\"";
+  struct Case {
+    const char* name;
+    std::string part_etag;
+    std::string head_etag;
+    int64_t length;
+    http::status head_status;
+    std::string metadata_key;
+    bool default_metadata;
+    bool recover;
+    bool head;
+    bool lost_response = false;
+    std::string completion_code = "NoSuchUpload";
+    int cancel_request = -1;
+  };
+  const std::vector<Case> cases = {
+      {"matching", first, complete, 8, http::status::ok, "", false, true, true},
+      {"normal-success", first, complete, 8, http::status::ok, "", false, true, false, false, ""},
+      {"lost-response", first, complete, 8, http::status::ok, "", false, true, true, true},
+      {"completion-denied", first, complete, 8, http::status::ok, "", false, false, false, false, "AccessDenied"},
+      {"wrong-size", first, complete, 9, http::status::ok, "", false, false, true},
+      {"wrong-content", first, first, 8, http::status::ok, "", false, false, true},
+      {"missing-etag", first, "", 8, http::status::ok, "", false, false, true},
+      {"missing-object", first, "", 8, http::status::not_found, "", false, false, true},
+      {"head-denied", first, "", 8, http::status::forbidden, "", false, false, true},
+      {"opaque-part", "opaque", complete, 8, http::status::ok, "", false, false, false},
+      {"invalid-hex", "\"z2fc714c4727ee9395f324cd2e7f331f\"", complete, 8, http::status::ok, "", false, false, false},
+      {"conditional", first, complete, 8, http::status::ok, "If-None-Match", false, false, false},
+      {"default-conditional", first, complete, 8, http::status::ok, "If-None-Match", true, false, false},
+      {"custom-metadata", first, complete, 8, http::status::ok, "custom", false, false, false},
+      {"cancel-before-head", first, complete, 8, http::status::ok, "", false, false, false, false, "NoSuchUpload", 3},
+      {"cancel-during-head", first, complete, 8, http::status::ok, "", false, false, true, false, "NoSuchUpload", 4},
+  };
+  for (const auto& test : cases) {
+    for (bool async_close : {false, true}) {
+      for (bool background : {false, true}) {
+        SCOPED_TRACE(test.name);
+        SCOPED_TRACE(async_close);
+        SCOPED_TRACE(background);
+        Response create{http::status::ok, 11};
+        create.set(http::field::content_type, "application/xml");
+        create.body() =
+            "<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>object</Key>"
+            "<UploadId>upload-id</UploadId></InitiateMultipartUploadResult>";
+        Response part1{http::status::ok, 11};
+        part1.set(http::field::etag, test.part_etag);
+        Response part2{http::status::ok, 11};
+        part2.set(http::field::etag, second);
+        Response missing{http::status::not_found, 11};
+        missing.set(http::field::content_type, "application/xml");
+        missing.body() =
+            "<Error><Code>" + test.completion_code + "</Code><Message>original completion failure</Message></Error>";
+        if (test.completion_code.empty()) {
+          missing.result(http::status::ok);
+          missing.body() =
+              "<CompleteMultipartUploadResult><ETag>" + complete + "</ETag></CompleteMultipartUploadResult>";
+        }
+        Response head{test.head_status, 11};
+        head.content_length(test.length);
+        if (!test.head_etag.empty())
+          head.set(http::field::etag, test.head_etag);
+        std::vector<Response> responses{create, part1, part2};
+        if (test.lost_response) {
+          // The service completed the upload, but the SDK sees an incomplete
+          // response, retries the same upload ID, and receives NoSuchUpload.
+          Response truncated{http::status::ok, 11};
+          truncated.set(http::field::content_type, "application/xml");
+          truncated.body() =
+              "<CompleteMultipartUploadResult><ETag>" + complete + "</ETag></CompleteMultipartUploadResult>";
+          truncated.content_length(truncated.body().size() + 1);
+          responses.push_back(truncated);
+        }
+        responses.push_back(missing);
+        responses.push_back(head);
+        arrow::StopSource stop;
+        S3ResponseServer server(std::move(responses), [&](size_t index, const auto& request, auto& response) {
+          // Background uploads can arrive in either order. Return each part's
+          // own ETag rather than assigning it according to arrival order.
+          if (request.method() == http::verb::put) {
+            const auto target = request.target();
+            response.set(http::field::etag, target.find("partNumber=1") != target.npos ? test.part_etag : second);
+          }
+          if (static_cast<int>(index) == test.cancel_request)
+            stop.RequestStop();
+        });
+        auto options = S3Options::FromAccessKey("ak", "sk");
+        options.region = "us-east-1";
+        options.scheme = "http";
+        options.endpoint_override = server.endpoint();
+        options.use_crt = false;
+        options.background_writes = background;
+        options.retry_strategy = S3RetryStrategy::GetAwsDefaultRetryStrategy(test.lost_response ? 1 : 0);
+        options.connect_timeout = 2;
+        options.request_timeout = 5;
+        std::shared_ptr<arrow::KeyValueMetadata> metadata;
+        if (!test.metadata_key.empty()) {
+          metadata = arrow::key_value_metadata({test.metadata_key}, {"*"});
+          if (test.default_metadata)
+            options.default_metadata = metadata;
+        }
+        ASSERT_AND_ASSIGN(auto fs, S3FileSystem::Make(options, arrow::io::IOContext(stop.token())));
+        ASSERT_AND_ASSIGN(auto stream, fs->OpenOutputStreamWithUploadSize(
+                                           "bucket/object", test.default_metadata ? nullptr : metadata, 4));
+        ASSERT_STATUS_OK(stream->Write(arrow::Buffer::FromString("abcdefgh")));
+        const auto status = async_close ? stream->CloseAsync().status() : stream->Close();
+        EXPECT_EQ(status.ok(), test.recover) << status;
+        if (!test.recover && test.cancel_request < 0) {
+          const auto detail = ExtendStatusDetail::UnwrapStatus(status);
+          ASSERT_NE(detail, nullptr) << status;
+          EXPECT_EQ(detail->code(), test.completion_code == "NoSuchUpload" ? ExtendStatusCode::AwsErrorNoSuchUpload
+                                                                           : ExtendStatusCode::AwsErrorAccessDenied);
+          EXPECT_NE(status.message().find("original completion failure"), std::string::npos);
+        }
+        EXPECT_EQ(server.requests(), (test.head ? 5 : 4) + (test.lost_response ? 1 : 0));
+        EXPECT_TRUE(stream->closed());
+      }
+    }
+  }
 }
 
 TEST_F(S3UnitTest, TestExtendErrorInFs) {
